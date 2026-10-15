@@ -170,7 +170,21 @@ function esc(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-function parseLinha(l) {
+const NOME_SEP = { ",": "vírgula", ";": "ponto e vírgula", "\t": "tabulação" };
+
+function detectarDelimitador(linha) {
+  const cont = { ",": 0, ";": 0, "\t": 0 };
+  let aspas = false;
+  for (const ch of linha) {
+    if (ch === '"') aspas = !aspas;
+    else if (!aspas && ch in cont) cont[ch]++;
+  }
+  let melhor = ",";
+  for (const d of [";", "\t"]) if (cont[d] > cont[melhor]) melhor = d;
+  return cont[melhor] > 0 ? melhor : ",";
+}
+
+function parseLinha(l, sep = ",") {
   const out = [];
   let c = "", q = false;
   for (let i = 0; i < l.length; i++) {
@@ -179,7 +193,7 @@ function parseLinha(l) {
       if (ch === '"') { if (l[i + 1] === '"') { c += '"'; i++; } else q = false; }
       else c += ch;
     } else if (ch === '"') q = true;
-    else if (ch === ",") { out.push(c); c = ""; }
+    else if (ch === sep) { out.push(c); c = ""; }
     else c += ch;
   }
   out.push(c);
@@ -191,18 +205,19 @@ function montarPrevia(texto) {
   const linhas = texto.split(/\r?\n/).filter(l => l.trim() !== "");
   if (!linhas.length) return "<small>Arquivo vazio.</small>";
 
-  const cab = parseLinha(linhas[0]);
+  const sep = detectarDelimitador(linhas[0]);
+  const cab = parseLinha(linhas[0], sep);
   const baixo = cab.map(c => c.trim().toLowerCase());
   let idx = baixo.findIndex(c => NOMES_NUM.some(n => c.includes(n)));
   if (idx < 0) idx = 0;  // mesma regra do servidor: assume a primeira coluna
 
-  const corpo = linhas.slice(1, 1 + LINHAS_PREVIA).map(parseLinha);
+  const corpo = linhas.slice(1, 1 + LINHAS_PREVIA).map(l => parseLinha(l, sep));
   const cabHtml = cab.map((c, i) => `<th class="${i === idx ? "col" : ""}">${esc(c)}</th>`).join("");
   const corpoHtml = corpo.map(r =>
     "<tr>" + cab.map((_, i) => `<td class="${i === idx ? "col" : ""}">${esc(r[i] ?? "")}</td>`).join("") + "</tr>"
   ).join("");
 
-  return `<small>${linhas.length - 1} linhas de dados · coluna lida como número: ` +
+  return `<small>${linhas.length - 1} linhas de dados · separador: ${NOME_SEP[sep]} · coluna lida como número: ` +
          `<b>${esc(cab[idx])}</b> · mostrando as primeiras ${corpo.length}</small>` +
          `<table><tr>${cabHtml}</tr>${corpoHtml}</table>`;
 }
