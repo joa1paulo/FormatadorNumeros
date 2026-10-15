@@ -4,6 +4,7 @@ import base64
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse
 
+from processador import previa_csv
 from servico import executar
 
 app = FastAPI(title="Formatador de Contatos")
@@ -162,63 +163,23 @@ function renderizar(est) {
 }
 
 // --- previa:inicio
-const NOMES_NUM = ["whatsapp", "telefone", "celular", "phone", "numero", "número"];
-const LINHAS_PREVIA = 8;
+const NOME_SEP = { ",": "vírgula", ";": "ponto e vírgula", "\t": "tabulação" };
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-const NOME_SEP = { ",": "vírgula", ";": "ponto e vírgula", "\t": "tabulação" };
-
-function detectarDelimitador(linha) {
-  const cont = { ",": 0, ";": 0, "\t": 0 };
-  let aspas = false;
-  for (const ch of linha) {
-    if (ch === '"') aspas = !aspas;
-    else if (!aspas && ch in cont) cont[ch]++;
-  }
-  let melhor = ",";
-  for (const d of [";", "\t"]) if (cont[d] > cont[melhor]) melhor = d;
-  return cont[melhor] > 0 ? melhor : ",";
-}
-
-function parseLinha(l, sep = ",") {
-  const out = [];
-  let c = "", q = false;
-  for (let i = 0; i < l.length; i++) {
-    const ch = l[i];
-    if (q) {
-      if (ch === '"') { if (l[i + 1] === '"') { c += '"'; i++; } else q = false; }
-      else c += ch;
-    } else if (ch === '"') q = true;
-    else if (ch === sep) { out.push(c); c = ""; }
-    else c += ch;
-  }
-  out.push(c);
-  return out;
-}
-
-function montarPrevia(texto) {
-  texto = texto.replace(/^\uFEFF/, "");
-  const linhas = texto.split(/\r?\n/).filter(l => l.trim() !== "");
-  if (!linhas.length) return "<small>Arquivo vazio.</small>";
-
-  const sep = detectarDelimitador(linhas[0]);
-  const cab = parseLinha(linhas[0], sep);
-  const baixo = cab.map(c => c.trim().toLowerCase());
-  let idx = baixo.findIndex(c => NOMES_NUM.some(n => c.includes(n)));
-  if (idx < 0) idx = 0;  // mesma regra do servidor: assume a primeira coluna
-
-  const corpo = linhas.slice(1, 1 + LINHAS_PREVIA).map(l => parseLinha(l, sep));
+function montarPrevia(d) {
+  if (d.vazio) return "<small>Arquivo vazio.</small>";
+  const cab = d.cabecalho, idx = d.idx_numero;
   const cabHtml = cab.map((c, i) => `<th class="${i === idx ? "col" : ""}">${esc(c)}</th>`).join("");
-  const corpoHtml = corpo.map(r =>
+  const corpoHtml = d.linhas.map(r =>
     "<tr>" + cab.map((_, i) => `<td class="${i === idx ? "col" : ""}">${esc(r[i] ?? "")}</td>`).join("") + "</tr>"
   ).join("");
-
-  return `<small>${linhas.length - 1} linhas de dados · separador: ${NOME_SEP[sep]} · coluna lida como número: ` +
-         `<b>${esc(cab[idx])}</b> · mostrando as primeiras ${corpo.length}</small>` +
+  const aviso = d.tem_cabecalho ? "" : " · <b>sem cabeçalho</b> (a 1ª linha também é dado)";
+  return `<small>${d.total_linhas} linhas de dados · separador: ${NOME_SEP[d.delimitador] ?? esc(d.delimitador)}${aviso}` +
+         ` · coluna lida como número: <b>${esc(cab[idx])}</b> · mostrando as primeiras ${d.linhas.length}</small>` +
          `<table><tr>${cabHtml}</tr>${corpoHtml}</table>`;
 }
 
@@ -227,9 +188,13 @@ async function previa(input, alvoId) {
   const arquivo = input.files[0];
   if (!arquivo) { alvo.innerHTML = ""; return; }
   try {
-    alvo.innerHTML = montarPrevia(await arquivo.text());
+    const fd = new FormData();
+    fd.append("arquivo", arquivo);
+    const resp = await fetch("/previa", { method: "POST", body: fd });
+    if (!resp.ok) throw new Error("falha");
+    alvo.innerHTML = montarPrevia(await resp.json());
   } catch (ex) {
-    alvo.innerHTML = "<small>Não foi possível ler o arquivo para pré-visualizar.</small>";
+    alvo.innerHTML = "<small>Não foi possível gerar a pré-visualização.</small>";
   }
 }
 // --- previa:fim
@@ -293,6 +258,11 @@ form.addEventListener("submit", async (e) => {
 @app.get("/", response_class=HTMLResponse)
 def home():
     return PAGINA
+
+
+@app.post("/previa")
+async def previa(arquivo: UploadFile = File(...)):
+    return previa_csv(await arquivo.read())
 
 
 @app.post("/processar")
