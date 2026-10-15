@@ -82,14 +82,14 @@ PAGINA = r"""<!doctype html>
       </div>
       <div class="uploads" id="uploads">
         <div class="upload">
-          <label>Lista de números <small>(obrigatório, CSV)</small>
-            <input type="file" name="talvez" accept=".csv" required>
+          <label>Lista de números <small>(obrigatório, CSV ou XLSX)</small>
+            <input type="file" name="talvez" accept=".csv,.xlsx" required>
           </label>
           <div class="previa" id="previa-talvez"></div>
         </div>
         <div class="upload" id="bloco-contatados">
-          <label>Já contatados <small>(CSV; serão removidos da lista principal)</small>
-            <input type="file" name="contatados" accept=".csv">
+          <label>Já contatados <small>(CSV ou XLSX; serão removidos da lista principal)</small>
+            <input type="file" name="contatados" accept=".csv,.xlsx">
           </label>
           <div class="previa" id="previa-contatados"></div>
         </div>
@@ -178,7 +178,7 @@ function montarPrevia(d) {
     "<tr>" + cab.map((_, i) => `<td class="${i === idx ? "col" : ""}">${esc(r[i] ?? "")}</td>`).join("") + "</tr>"
   ).join("");
   const aviso = d.tem_cabecalho ? "" : " · <b>sem cabeçalho</b> (a 1ª linha também é dado)";
-  return `<small>${d.total_linhas} linhas de dados · separador: ${NOME_SEP[d.delimitador] ?? esc(d.delimitador)}${aviso}` +
+  return `<small>${d.total_linhas} linhas de dados · ${d.formato === "xlsx" ? "planilha Excel (aba: " + esc(d.aba) + ")" : "separador: " + (NOME_SEP[d.delimitador] ?? esc(d.delimitador))}${aviso}` +
          ` · coluna lida como número: <b>${esc(cab[idx])}</b> · mostrando as primeiras ${d.linhas.length}</small>` +
          `<table><tr>${cabHtml}</tr>${corpoHtml}</table>`;
 }
@@ -191,10 +191,13 @@ async function previa(input, alvoId) {
     const fd = new FormData();
     fd.append("arquivo", arquivo);
     const resp = await fetch("/previa", { method: "POST", body: fd });
-    if (!resp.ok) throw new Error("falha");
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => ({}));
+      throw new Error(e.detail || "Não foi possível gerar a pré-visualização.");
+    }
     alvo.innerHTML = montarPrevia(await resp.json());
   } catch (ex) {
-    alvo.innerHTML = "<small>Não foi possível gerar a pré-visualização.</small>";
+    alvo.innerHTML = `<small class="erro">${esc(ex.message)}</small>`;
   }
 }
 // --- previa:fim
@@ -262,7 +265,10 @@ def home():
 
 @app.post("/previa")
 async def previa(arquivo: UploadFile = File(...)):
-    return previa_csv(await arquivo.read())
+    try:
+        return previa_csv(await arquivo.read())
+    except ValueError as erro:
+        raise HTTPException(400, str(erro))
 
 
 @app.post("/processar")
@@ -279,8 +285,8 @@ async def processar(
 
     try:
         zip_bytes, estatisticas = executar(conteudo_talvez, conteudo_contatados, formato)
-    except UnicodeDecodeError:
-        raise HTTPException(400, "Não foi possível ler o arquivo. Salve o CSV como UTF-8.")
+    except ValueError as erro:  # formato não suportado, planilha corrompida etc.
+        raise HTTPException(400, str(erro))
 
     return {
         "estatisticas": estatisticas,

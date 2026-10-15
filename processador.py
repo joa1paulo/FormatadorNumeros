@@ -1,4 +1,4 @@
-"""Etapa 2: leitura dos CSVs (vários estilos), formatação e remoção de duplicados."""
+"""Etapa 2: leitura de CSV e XLSX (vários estilos), formatação e remoção de duplicados."""
 import csv
 import io
 from dataclasses import dataclass, field
@@ -25,7 +25,8 @@ class Resumo:
 
 @dataclass
 class Analise:
-    delimitador: str
+    formato: str           # "csv" ou "xlsx"
+    detalhe: str           # csv: o separador; xlsx: o nome da aba lida
     tem_cabecalho: bool
     cabecalho: list
     dados: list            # linhas de dados (sem linhas vazias)
@@ -62,20 +63,56 @@ def _prioridade(cabecalho: str) -> int | None:
 def _decodificar(conteudo: str | bytes) -> str:
     if isinstance(conteudo, str):
         return conteudo.lstrip("\ufeff")
+    if conteudo[:2] in (b"\xff\xfe", b"\xfe\xff"):  # "Texto Unicode" do Excel (UTF-16)
+        return conteudo.decode("utf-16")
     try:
         return conteudo.decode("utf-8-sig")
     except UnicodeDecodeError:  # CSV salvo pelo Excel em português costuma ser cp1252
         return conteudo.decode("cp1252", errors="replace")
 
 
-def analisar(conteudo: str | bytes) -> Analise | None:
-    """Descobre separador, se há cabeçalho e quais colunas são número e nome."""
+def _texto_celula(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))  # 5521994833600.0 -> 5521994833600
+    return str(v)
+
+
+def _linhas_xlsx(conteudo: bytes):
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise ValueError("Leitura de .xlsx indisponível neste servidor (falta instalar o openpyxl).")
+    try:
+        wb = load_workbook(io.BytesIO(conteudo), read_only=True, data_only=True)
+        aba = wb.worksheets[0]  # primeira aba da planilha
+        linhas = [[_texto_celula(c) for c in linha] for linha in aba.iter_rows(values_only=True)]
+        nome_aba = aba.title
+        wb.close()
+    except Exception:
+        raise ValueError("Não foi possível abrir o .xlsx (arquivo corrompido ou protegido por senha).")
+    return linhas, "xlsx", nome_aba
+
+
+def _ler_linhas(conteudo: str | bytes):
+    """Devolve (linhas, formato, detalhe). Aceita CSV (, ; tab) e XLSX; recusa o resto com mensagem clara."""
+    if isinstance(conteudo, bytes):
+        if conteudo.startswith(b"PK\x03\x04"):  # .xlsx é um zip
+            return _linhas_xlsx(conteudo)
+        if conteudo.startswith(b"\xd0\xcf\x11\xe0"):  # .xls antigo ou arquivo protegido por senha
+            raise ValueError("Arquivo .xls antigo ou protegido por senha. Salve como .xlsx ou .csv e envie de novo.")
+        if b"\x00" in conteudo[:4096] and conteudo[:2] not in (b"\xff\xfe", b"\xfe\xff"):
+            raise ValueError("Formato de arquivo não suportado. Envie um arquivo .csv ou .xlsx.")
     texto = _decodificar(conteudo)
     delimitador = detectar_delimitador(texto)
-    linhas = [
-        l for l in csv.reader(io.StringIO(texto), delimiter=delimitador)
-        if l and any(c.strip() for c in l)
-    ]
+    return list(csv.reader(io.StringIO(texto), delimiter=delimitador)), "csv", delimitador
+
+
+def analisar(conteudo: str | bytes) -> Analise | None:
+    """Descobre separador, se há cabeçalho e quais colunas são número e nome."""
+    linhas_brutas, formato, detalhe = _ler_linhas(conteudo)
+    linhas = [l for l in linhas_brutas if l and any(c.strip() for c in l)]
     if not linhas:
         return None
 
@@ -112,7 +149,7 @@ def analisar(conteudo: str | bytes) -> Analise | None:
         if idx_nome == idx_num:
             idx_nome = None
 
-    return Analise(delimitador, tem_cabecalho, cabecalho, dados, idx_num, idx_nome, ncols)
+    return Analise(formato, detalhe, tem_cabecalho, cabecalho, dados, idx_num, idx_nome, ncols)
 
 
 def processar_csv(conteudo: str | bytes) -> Resumo:
@@ -155,7 +192,9 @@ def previa_csv(conteudo: str | bytes, n: int = 8) -> dict:
     linhas = [[*l, *[""] * (ncols - len(l))] for l in a.dados[:n]]
     return {
         "vazio": False,
-        "delimitador": a.delimitador,
+        "formato": a.formato,
+        "delimitador": a.detalhe if a.formato == "csv" else "",
+        "aba": a.detalhe if a.formato == "xlsx" else "",
         "tem_cabecalho": a.tem_cabecalho,
         "cabecalho": cabecalho,
         "linhas": linhas,
@@ -240,6 +279,57 @@ def _testes():
     d = previa_csv("Nome;WhatsApp\nAna;5521994833600\n")
     assert (d["delimitador"], d["idx_numero"], d["cabecalho"]) == (";", 1, ["Nome", "WhatsApp"])
     assert previa_csv("")["vazio"] is True
+
+    # ---- planilhas .xlsx (o cliente enviou uma com 5 colunas) ----
+    from openpyxl import Workbook
+
+    def xlsx(linhas, abas_extras=False):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Contatos"
+        for l in linhas:
+            ws.append(l)
+        if abas_extras:
+            wb.create_sheet("Outra").append(["lixo", "lixo"])
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    planilha = xlsx([
+        ["Nome", "Email", "Telefone", "Cidade", "Etapa"],
+        ["Ana", "ana@x.com", 5521994833600, "Rio", "Fez Contato"],         # número como inteiro
+        ["Bia", "bia@x.com", "(21) 98612-8098", "Niterói", "Novo"],        # número como texto
+        ["Caio", "caio@x.com", 5521986128098.0, "Rio", "Novo"],            # decimal: repete a Bia
+        ["Duda", "duda@x.com", "(34) 3234-5678", "Uberlândia", "Novo"],    # fixo
+        ["Eli", "eli@x.com", None, "SP", "Novo"],                          # célula vazia
+    ], abas_extras=True)
+    r = processar_csv(planilha)
+    assert [(c["nome"], c["numero"]) for c in r.ok] == [("Ana", "+5521994833600"), ("Bia", "+5521986128098")], r.ok
+    assert (r.total, r.duplicados, len(r.fixos), len(r.invalidos)) == (5, 1, 1, 1), r
+    d = previa_csv(planilha)
+    assert (d["formato"], d["aba"], d["idx_numero"], len(d["cabecalho"])) == ("xlsx", "Contatos", 2, 5), d
+
+    # xlsx sem cabeçalho e no estilo "já contatados"
+    assert len(processar_csv(xlsx([[5521994833600], [5521986128098]])).ok) == 2
+    c = processar_csv(xlsx([["Nome do Contato", "WhatsApp do Contato", "Etapa da Jornada"],
+                            ["Lucia", 5521994833600, "Fez Contato"]]))
+    assert c.ok == [{"nome": "Lucia", "numero": "+5521994833600"}]
+
+    # formatos que não dá para ler recebem mensagem clara (e não derrubam o servidor)
+    for ruim, trecho in [
+        (b"\xd0\xcf\x11\xe0" + b"x" * 50, ".xls antigo"),
+        (b"PK\x03\x04 isto nao e uma planilha", "Não foi possível abrir"),
+        (b"%PDF-1.4\x00\x01\x02 binario", "não suportado"),
+    ]:
+        try:
+            processar_csv(ruim)
+            raise AssertionError("deveria ter recusado")
+        except ValueError as e:
+            assert trecho in str(e), (trecho, str(e))
+
+    # CSV em UTF-16 ("Texto Unicode" do Excel) também funciona
+    utf16 = "Nome\tTelefone\nAna\t5521994833600\n".encode("utf-16")
+    assert processar_csv(utf16).ok[0]["numero"] == "+5521994833600"
     print("testes da etapa 2 OK")
 
 
