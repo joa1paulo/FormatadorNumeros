@@ -1,13 +1,21 @@
 """Etapa 6: interface web com dashboard (FastAPI). Rodar com: uvicorn main:app --reload"""
-import base64
+import json
+import os
+import threading
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from processador import previa_csv
 from servico import executar
 
 app = FastAPI(title="Formatador de Contatos")
+
+# Limites que protegem a memória do servidor (ajustáveis por variável de ambiente no Render).
+# Medido: 1 milhão de linhas usa de ~150 MB (números válidos) a ~300 MB (tudo inválido).
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "100"))   # tamanho de cada arquivo
+MAX_LINHAS = int(os.environ.get("MAX_LINHAS", "1000000"))      # linhas somando os dois arquivos
+_TRAVA = threading.Semaphore(1)  # um processamento por vez: dois ao mesmo tempo somariam a memória
 
 PAGINA = r"""<!doctype html>
 <html lang="pt-BR">
@@ -178,7 +186,7 @@ function montarPrevia(d) {
     "<tr>" + cab.map((_, i) => `<td class="${i === idx ? "col" : ""}">${esc(r[i] ?? "")}</td>`).join("") + "</tr>"
   ).join("");
   const aviso = d.tem_cabecalho ? "" : " · <b>sem cabeçalho</b> (a 1ª linha também é dado)";
-  return `<small>${d.total_linhas} linhas de dados · ${d.formato === "xlsx" ? "planilha Excel (aba: " + esc(d.aba) + ")" : "separador: " + (NOME_SEP[d.delimitador] ?? esc(d.delimitador))}${aviso}` +
+  return `<small>${d.aproximado ? "cerca de " : ""}${d.total_linhas ?? "?"} linhas de dados · ${d.formato === "xlsx" ? "planilha Excel (aba: " + esc(d.aba) + ")" : "separador: " + (NOME_SEP[d.delimitador] ?? esc(d.delimitador))}${aviso}` +
          ` · coluna lida como número: <b>${esc(cab[idx])}</b> · mostrando as primeiras ${d.linhas.length}</small>` +
          `<table><tr>${cabHtml}</tr>${corpoHtml}</table>`;
 }
@@ -234,14 +242,15 @@ form.addEventListener("submit", async (e) => {
     const fd = new FormData(form);
     if (!chkMesclar.checked) fd.delete("contatados");
     const resp = await fetch("/processar", { method: "POST", body: fd });
-    const dados = await resp.json();
-    if (!resp.ok) throw new Error(dados.detail || "Erro ao processar os arquivos.");
+    if (!resp.ok) {
+      const e = await resp.json().catch(() => ({}));
+      throw new Error(e.detail || "Erro ao processar os arquivos.");
+    }
+    renderizar(JSON.parse(resp.headers.get("X-Estatisticas")));
 
-    renderizar(dados.estatisticas);
-
-    const bytes = Uint8Array.from(atob(dados.zip_base64), ch => ch.charCodeAt(0));
+    const blob = await resp.blob();
     if (urlAnterior) URL.revokeObjectURL(urlAnterior);
-    urlAnterior = URL.createObjectURL(new Blob([bytes], { type: "application/zip" }));
+    urlAnterior = URL.createObjectURL(blob);
     const link = document.getElementById("download");
     link.href = urlAnterior;
     link.download = "contatos_formatados.zip";
@@ -263,16 +272,30 @@ def home():
     return PAGINA
 
 
+def _checar_tamanho(arquivo: UploadFile) -> int:
+    """Tamanho do upload (que o servidor já guarda em disco). Recusa arquivos acima do limite."""
+    f = arquivo.file
+    tamanho = f.seek(0, 2)
+    f.seek(0)
+    if tamanho > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(
+            413, f"O arquivo tem {tamanho / 1048576:.0f} MB e o limite é de {MAX_UPLOAD_MB} MB. "
+                 "Divida em arquivos menores.")
+    return tamanho
+
+
+# "def" (e não "async def"): o trabalho pesado roda em outra thread e não trava o servidor
 @app.post("/previa")
-async def previa(arquivo: UploadFile = File(...)):
+def previa(arquivo: UploadFile = File(...)):
+    _checar_tamanho(arquivo)
     try:
-        return previa_csv(await arquivo.read())
+        return previa_csv(arquivo.file)
     except ValueError as erro:
         raise HTTPException(400, str(erro))
 
 
 @app.post("/processar")
-async def processar(
+def processar(
     talvez: UploadFile = File(...),
     contatados: UploadFile | None = File(None),
     formato: str = Form("csv"),
@@ -280,15 +303,33 @@ async def processar(
     if formato not in ("csv", "txt"):
         raise HTTPException(400, "Formato deve ser 'csv' ou 'txt'.")
 
-    conteudo_talvez = await talvez.read()
-    conteudo_contatados = await contatados.read() if contatados and contatados.filename else None
+    _checar_tamanho(talvez)
+    arquivo_contatados = None
+    if contatados is not None and contatados.filename and _checar_tamanho(contatados) > 0:
+        arquivo_contatados = contatados.file
 
     try:
-        zip_bytes, estatisticas = executar(conteudo_talvez, conteudo_contatados, formato)
-    except ValueError as erro:  # formato não suportado, planilha corrompida etc.
+        with _TRAVA:
+            arquivo_zip, estatisticas = executar(talvez.file, arquivo_contatados, formato, MAX_LINHAS)
+    except ValueError as erro:  # formato não suportado, planilha corrompida, limite de linhas...
         raise HTTPException(400, str(erro))
 
-    return {
-        "estatisticas": estatisticas,
-        "zip_base64": base64.b64encode(zip_bytes).decode("ascii"),
-    }
+    tamanho = arquivo_zip.seek(0, 2)
+    arquivo_zip.seek(0)
+
+    def blocos():  # envia o .zip aos poucos e apaga o arquivo temporário no fim
+        try:
+            while bloco := arquivo_zip.read(1 << 20):
+                yield bloco
+        finally:
+            arquivo_zip.close()
+
+    return StreamingResponse(
+        blocos(),
+        media_type="application/zip",
+        headers={
+            "Content-Length": str(tamanho),
+            "X-Estatisticas": json.dumps(estatisticas),  # números do dashboard (ASCII, poucos bytes)
+            "Cache-Control": "no-store",
+        },
+    )

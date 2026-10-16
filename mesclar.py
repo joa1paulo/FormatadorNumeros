@@ -1,43 +1,73 @@
-"""Etapa 3: mesclagem das listas "já contatados" e "talvez não contatados"."""
-from dataclasses import dataclass, field
+"""Etapa 3: mesclagem das listas "já contatados" e "talvez não contatados".
+
+Nada é copiado: o resultado é calculado em fluxo a partir dos dois resumos já processados.
+"""
+from itertools import chain
 
 from processador import Resumo, processar_csv
 
 
-@dataclass
 class ResultadoMesclagem:
-    novos: list            # números da lista "talvez" que ainda NÃO foram contatados
-    ja_contatados: list    # números da lista "talvez" removidos por já terem sido contatados
-    fixos: list            # fixos de ambas as listas (arquivo separado)
-    invalidos: list        # inválidos de ambas as listas
-    duplicados: int        # duplicados removidos dentro de cada lista
-    mesclados: list = field(default_factory=list)  # união das duas listas, sem repetidos
+    def __init__(self, contatados: Resumo, talvez: Resumo):
+        self.contatados = contatados
+        self.talvez = talvez
+        ja = contatados.ok
+        self.n_ja_contatados = sum(1 for numero in talvez.ok if numero in ja)
+        self.n_novos = len(talvez.ok) - self.n_ja_contatados
+        self.n_mesclados = len(ja) + self.n_novos
+
+    @property
+    def duplicados(self) -> int:
+        return self.contatados.duplicados + self.talvez.duplicados
+
+    # ---- iteradores (usados na exportação; não geram listas na memória) ----
+    def iter_novos(self):
+        """(número, nome) de quem está na lista principal e ainda NÃO foi contatado."""
+        ja = self.contatados.ok
+        return ((numero, nome) for numero, nome in self.talvez.ok.items() if numero not in ja)
+
+    def iter_ja_contatados(self):
+        ja = self.contatados.ok
+        return ((numero, nome) for numero, nome in self.talvez.ok.items() if numero in ja)
+
+    def iter_mesclados(self):
+        """União das duas listas: primeiro os já contatados, depois os novos, sem repetir."""
+        nomes_talvez = self.talvez.ok
+        for numero, nome in self.contatados.ok.items():
+            yield numero, nome or nomes_talvez.get(numero, "")
+        yield from self.iter_novos()
+
+    def iter_fixos(self):
+        return chain(self.contatados.fixos, self.talvez.fixos)
+
+    def iter_invalidos(self):
+        return chain(self.contatados.invalidos, self.talvez.invalidos)
+
+    # ---- versões em lista, só para testes e arquivos pequenos ----
+    @property
+    def novos(self) -> list:
+        return [{"nome": nome, "numero": numero} for numero, nome in self.iter_novos()]
+
+    @property
+    def ja_contatados(self) -> list:
+        return [{"nome": nome, "numero": numero} for numero, nome in self.iter_ja_contatados()]
+
+    @property
+    def mesclados(self) -> list:
+        return [{"nome": nome, "numero": numero} for numero, nome in self.iter_mesclados()]
+
+    @property
+    def fixos(self) -> list:
+        return list(self.iter_fixos())
+
+    @property
+    def invalidos(self) -> list:
+        return list(self.iter_invalidos())
 
 
 def mesclar(contatados: Resumo, talvez: Resumo) -> ResultadoMesclagem:
     # o cruzamento é feito pelos números já formatados (E.164), não pelo texto original
-    numeros_contatados = {c["numero"] for c in contatados.ok}
-
-    novos, removidos = [], []
-    for c in talvez.ok:
-        (removidos if c["numero"] in numeros_contatados else novos).append(c)
-
-    # união: primeiro os já contatados, depois os novos (sem repetir nenhum número).
-    # Se o contato não tem nome na lista de contatados, aproveita o nome da outra lista.
-    nomes_talvez = {c["numero"]: c["nome"] for c in talvez.ok}
-    mesclados = [
-        {**c, "nome": c["nome"] or nomes_talvez.get(c["numero"], "")}
-        for c in contatados.ok
-    ] + novos
-
-    return ResultadoMesclagem(
-        mesclados=mesclados,
-        novos=novos,
-        ja_contatados=removidos,
-        fixos=contatados.fixos + talvez.fixos,
-        invalidos=contatados.invalidos + talvez.invalidos,
-        duplicados=contatados.duplicados + talvez.duplicados,
-    )
+    return ResultadoMesclagem(contatados, talvez)
 
 
 def _testes():
@@ -64,6 +94,7 @@ def _testes():
         ("Ana Laura", "+5532988176797"),
         ("", "+5521986128098"),
     ], r.mesclados
+    assert (r.n_novos, r.n_ja_contatados, r.n_mesclados) == (1, 1, 3)
     print("testes da etapa 3 OK")
 
 
